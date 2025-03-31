@@ -1,0 +1,10 @@
+pandas
+pyarrow
+fastparquet
+requests
+beautifulsoup4
+cairosvg
+torch
+torchvision
+scikit-learn
+google-generativeai
