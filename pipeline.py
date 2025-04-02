@@ -19,7 +19,8 @@ from dotenv import load_dotenv
 import shutil as shutuil
 import cv2
 import numpy as np
-
+from sklearn.neighbors import BallTree
+from collections import Counter
 
 class LogoNet(nn.Module):
     """
@@ -101,6 +102,7 @@ class Pipeline:
         self.features = []
         self.clusters = []
         self.image_clusters = []
+        self.unclustered = []
         
         self.similarity_threshold = similarity_threshold
         
@@ -464,45 +466,97 @@ class Pipeline:
         
         print(f"Extracted {len(self.features)} features successfully.")
 
-    def generate_clusters(self):        
-        # Total number of features to process
-        total_features = len(self.features)
+    def generate_clusters(self):
+        # During initialization
+        features_array = np.vstack([f[0].cpu().numpy() for f in self.features if f is not None])
+        filenames = [f[1] for f in self.features if f is not None]
+        self.tree = BallTree(features_array, leaf_size=40, metric='euclidean')
 
-        # Iterate through features with a progress bar
-        for feature in tqdm(self.features, desc="Clustering Images", unit="image", total=total_features):
-            if feature is None:
-                continue
-            feature, filename = feature
+        # During clustering
+        clusters = {}
+        indices_map = {}
+        for i, feature in enumerate(tqdm(features_array)):
+            # Find all neighbors within threshold distance
+            indices = self.tree.query_radius([feature], r=1-self.similarity_threshold)[0]
             
-            best_cluster = -1
-            best_cluster_raport = 0
-
-            for i in range(len(self.clusters)):
-                cluster = self.clusters[i]
-                close = 0
-                far = 0
-
-                for image_feature in cluster:
-                    similarity = F.cosine_similarity(feature, image_feature, dim=1).item()
-                    
-                    if similarity < self.similarity_threshold:
-                        far += 1
-                    else:
-                        close += 1
-
-                if close / (close + far) > 0.8 and close / (close + far) > best_cluster_raport:
-                    best_cluster = i
-                    best_cluster_raport = close / (close + far)
-
-            if best_cluster == -1:
-                self.clusters.append([feature])
-                self.image_clusters.append([filename])
-            else:
-                self.clusters[best_cluster].append(feature)
-                self.image_clusters[best_cluster].append(filename)
+            # Find which existing cluster this belongs to, if any
+            # assigned = False
+            # for cluster_id in list(clusters.keys()):
+            #     if any(idx in clusters[cluster_id] for idx in indices):
+            #         clusters[cluster_id].append(i)
+            #         indices_map[i] = cluster_id
+            #         assigned = True
+            #         break
+            if indices.size > 0:
+                # Filter indices to only include those that have already been assigned to clusters
+                assigned_indices = [i for i in indices if i in indices_map]
                 
+                if assigned_indices:  # If we have any assigned neighbors
+                    clusters_found = [indices_map[i] for i in assigned_indices]
+                    counter = Counter(clusters_found)
+                    most_common = counter.most_common(1)
+                    clusters[most_common[0][0]].append(i)
+                    indices_map[i] = most_common[0][0]
+                else:
+                    # No previously assigned neighbors, create new cluster
+                    new_id = len(clusters)
+                    clusters[new_id] = [i]
+                    indices_map[i] = new_id
+            else:
+                # No similar points found, create a new cluster
+                new_id = len(clusters)
+                clusters[new_id] = [i]
+                indices_map[i] = new_id
+                
+        # Convert clusters to list of lists
+        self.clusters = [clusters[i] for i in clusters]
+        self.image_clusters = [[filenames[i] for i in cluster] for cluster in self.clusters]
+        
+        self.unclustered = [cluster[0] for cluster in self.image_clusters if len(cluster) == 1]
+        self.image_clusters = [cluster for cluster in self.image_clusters if len(cluster) > 1] 
+        
         print("Clustering completed.")
-        print(f"Number of clusters: {len(self.clusters)}")
+        print(f"Number of clusters: {len(self.image_clusters)}")
+
+    # def generate_clusters(self):        
+    #     # Total number of features to process
+    #     total_features = len(self.features)
+
+    #     # Iterate through features with a progress bar
+    #     for feature in tqdm(self.features, desc="Clustering Images", unit="image", total=total_features):
+    #         if feature is None:
+    #             continue
+    #         feature, filename = feature
+            
+    #         best_cluster = -1
+    #         best_cluster_raport = 0
+
+    #         for i in range(len(self.clusters)):
+    #             cluster = self.clusters[i]
+    #             close = 0
+    #             far = 0
+
+    #             for image_feature in cluster:
+    #                 similarity = F.cosine_similarity(feature, image_feature, dim=1).item()
+                    
+    #                 if similarity < self.similarity_threshold:
+    #                     far += 1
+    #                 else:
+    #                     close += 1
+
+    #             if close / (close + far) > 0.8 and close / (close + far) > best_cluster_raport:
+    #                 best_cluster = i
+    #                 best_cluster_raport = close / (close + far)
+
+    #         if best_cluster == -1:
+    #             self.clusters.append([feature])
+    #             self.image_clusters.append([filename])
+    #         else:
+    #             self.clusters[best_cluster].append(feature)
+    #             self.image_clusters[best_cluster].append(filename)
+                
+    #     print("Clustering completed.")
+    #     print(f"Number of clusters: {len(self.clusters)}")
 
     def generate_output(self):
         
@@ -512,6 +566,12 @@ class Pipeline:
 
             for image_path in self.image_clusters[i]:
                 os.rename(f"./images/{image_path}", f"./clusters/cluster{i}/{image_path}")
+                
+        if not os.path.exists(f"./clusters/a_unclustered"):
+            os.makedirs(f"./clusters/a_unclustered")
+            
+        for image_path in self.unclustered:
+            os.rename(f"./images/{image_path}", f"./clusters/a_unclustered/{image_path}")
                 
         domain_clusters = [[self.df['domain'][int(y.split('.')[0])] for y in x]for x in self.image_clusters]
         json.dump(domain_clusters, open('clusters.json', 'w'), indent=4)
@@ -525,9 +585,9 @@ class Pipeline:
         
         self.download_images_clearbit()
         
-        # self.download_images_gemini()
+        self.download_images_gemini()
         
-        # self.convert_svgs()
+        self.convert_svgs()
         
         self.load_model()
         
@@ -542,6 +602,6 @@ class Pipeline:
 if __name__ == "__main__":
     input_file = 'logos.snappy.parquet'
     output_dir = 'clusters'
-    pipeline = Pipeline(input_file, output_dir, similarity_threshold=0.8)
+    pipeline = Pipeline(input_file, output_dir, similarity_threshold=0.6)
     pipeline.run()
     
