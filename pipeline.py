@@ -17,6 +17,8 @@ from tqdm import tqdm
 from google import genai 
 from dotenv import load_dotenv
 import shutil as shutuil
+import cv2
+import numpy as np
 
 
 class LogoNet(nn.Module):
@@ -87,7 +89,7 @@ class LogoNet(nn.Module):
         return embedding
 
 class Pipeline:
-    def __init__(self, input_file, output_dir, max_workers=10, similarity_threshold=0.7):
+    def __init__(self, input_file, output_dir, max_workers=10, similarity_threshold=0.9):
         self.max_workers = max_workers
         self.input_file = input_file
         self.output_dir = output_dir
@@ -390,11 +392,36 @@ class Pipeline:
     def extract_logo_features(self, image_path):
         """Extract features from a logo image using a specialized logo model"""
         try:
-            # Open image
-            image = Image.open(f"./images/{image_path}").convert('RGB')
+            # # Open image
+            # image = Image.open(f"./images/{image_path}").convert('RGB')
+            
+             
+            # Read the image with alpha channel (if available)
+            img = cv2.imread(f"./images/{image_path}", cv2.IMREAD_UNCHANGED)
+            if img is None:
+                return None
+
+            # Check if the image has an alpha channel (transparency)
+            if img.shape[-1] == 4:  # PNG with transparency
+                bgr, alpha = img[:, :, :3], img[:, :, 3]  # Separate BGR and Alpha channels
+                
+                # Create a white background
+                white_bg = np.ones_like(bgr, dtype=np.uint8) * 255
+                
+                # Blend the image onto the white background
+                alpha = alpha[:, :, np.newaxis] / 255.0  # Normalize alpha to range [0,1]
+                img = (bgr * alpha + white_bg * (1 - alpha)).astype(np.uint8)  # Composite
+
+            else:
+                img = img[:, :, :3]  # Remove alpha channel if not needed
+            
+            # # Convert to grayscale
+            # img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            img = Image.fromarray(img)
             
             # Apply transformations
-            image = self.inference_transform(image).unsqueeze(0)
+            image = self.inference_transform(img).unsqueeze(0)
             
             # Move to the same device as model
             device = next(self.model.parameters()).device
@@ -408,6 +435,7 @@ class Pipeline:
             return F.normalize(features, p=2, dim=1).view(1, -1), image_path
         
         except Exception as e:
+            print(f"Error processing image {image_path}: {e}")
             return None
         
     def extract_features(self):
@@ -497,9 +525,9 @@ class Pipeline:
         
         self.download_images_clearbit()
         
-        self.download_images_gemini()
+        # self.download_images_gemini()
         
-        self.convert_svgs()
+        # self.convert_svgs()
         
         self.load_model()
         
@@ -514,6 +542,6 @@ class Pipeline:
 if __name__ == "__main__":
     input_file = 'logos.snappy.parquet'
     output_dir = 'clusters'
-    pipeline = Pipeline(input_file, output_dir)
+    pipeline = Pipeline(input_file, output_dir, similarity_threshold=0.8)
     pipeline.run()
     
