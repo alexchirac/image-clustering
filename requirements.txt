@@ -8,3 +8,5 @@ torch
 torchvision
 scikit-learn
 google-generativeai
+dotenv
+opencv-python

@@ -14,13 +14,14 @@ from PIL import Image
 from torchvision import transforms
 import json
 from tqdm import tqdm
-from google import genai 
+import google.generativeai as genai 
 from dotenv import load_dotenv
 import shutil as shutuil
 import cv2
 import numpy as np
 from sklearn.neighbors import BallTree
 from collections import Counter
+import sys
 
 class LogoNet(nn.Module):
     """
@@ -31,6 +32,12 @@ class LogoNet(nn.Module):
     4. Rotation and scale invariance
     """
     def __init__(self, embedding_dim=512):
+        """
+        Initialize the LogoNet model with specialized architecture for logo recognition.
+        
+        Args:
+            embedding_dim (int): Dimension of the output embedding vector. Default is 512.
+        """
         super(LogoNet, self).__init__()
         
         # Base feature extractor (EfficientNet is good for logos due to better edge detection)
@@ -65,6 +72,15 @@ class LogoNet(nn.Module):
         )
     
     def forward(self, x):
+        """
+        Forward pass of the LogoNet model.
+        
+        Args:
+            x (torch.Tensor): Input tensor with shape [batch_size, channels, height, width]
+            
+        Returns:
+            torch.Tensor: Logo embedding vector
+        """
         # Extract base features
         x = self.backbone(x)
         
@@ -90,7 +106,20 @@ class LogoNet(nn.Module):
         return embedding
 
 class Pipeline:
+    """
+    End-to-end pipeline for logo processing, including downloading, feature extraction,
+    and clustering.
+    """
     def __init__(self, input_file, output_dir, max_workers=10, similarity_threshold=0.9):
+        """
+        Initialize the logo processing pipeline.
+        
+        Args:
+            input_file (str): Path to the input file containing domain data
+            output_dir (str): Directory to save output clusters
+            max_workers (int): Maximum number of concurrent workers for threading. Default is 10.
+            similarity_threshold (float): Threshold for considering logos similar. Default is 0.9.
+        """
         self.max_workers = max_workers
         self.input_file = input_file
         self.output_dir = output_dir
@@ -107,6 +136,9 @@ class Pipeline:
         self.similarity_threshold = similarity_threshold
         
     def load_data(self):
+        """
+        Load data from the input file into a pandas DataFrame.
+        """
         # Load the CSV file into a DataFrame
         self.df = pd.read_parquet(self.input_file)
         self.df['extracted'] = False
@@ -115,6 +147,15 @@ class Pipeline:
         
         
     def process_domain(self, data):
+        """
+        Process a single domain to download its logo from Clearbit.
+        
+        Args:
+            data (tuple): Tuple containing (index, domain)
+            
+        Returns:
+            tuple: (index, success_status)
+        """
         index, domain = data
         
         url = f"https://logo.clearbit.com/{domain}"
@@ -135,6 +176,9 @@ class Pipeline:
             return (index, False)
         
     def download_images_clearbit(self):
+        """
+        Download logo images for all domains using the Clearbit API in parallel.
+        """
         # Prepare the data for processing
         domains = list(enumerate(self.df['domain']))
         total = len(domains)
@@ -206,6 +250,16 @@ class Pipeline:
             return html  # Return empty string if cleaning fails
         
     def download_png(self, url, save_path):
+        """
+        Download an image from a URL and save it to the specified path.
+        
+        Args:
+            url (str): URL of the image to download
+            save_path (str): Path where the image will be saved
+            
+        Returns:
+            bool: True if download was successful
+        """
         # Send GET request to the URL
         response = requests.get(url, stream=True)
         
@@ -220,6 +274,13 @@ class Pipeline:
         return True
 
     def proc_data(self, url, idx):
+        """
+        Process downloaded image data and save it with the appropriate extension.
+        
+        Args:
+            url (str): URL of the image
+            idx (int): Index for the saved file
+        """
         if '.svg' in url:
             save_path = f'./images/{idx}.svg'
         elif '.png' in url:
@@ -230,20 +291,39 @@ class Pipeline:
         self.download_png(url, save_path)
 
     def call_gemini(self, prompt):
-        client = genai.Client(api_key=os.getenv("API_KEY"))
-
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=prompt,
-        )
-
+        """
+        Call the Gemini API with a prompt.
+        
+        Args:
+            prompt (str): Prompt to send to Gemini API
+            
+        Returns:
+            str: Response from Gemini API
+        """
+        # Configure the API key
+        genai.configure(api_key=os.getenv("API_KEY"))
+        
+        # Generate content
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        response = model.generate_content(prompt)
+        
         return response.text
 
     def process_nth_domain(self, n):
+        """
+        Process the nth domain to extract its logo using website header and Gemini.
+        
+        Args:
+            n (int): Index of the domain to process
+            
+        Returns:
+            bool: True if logo extraction was successful
+        """
         if self.df['extracted'][n] == False:
             try:
                 url = f"https://www.{self.df['domain'][n]}"
                 response = requests.get(url, timeout=10)
+
                 if response.status_code == 200:
                     html = response.text
                     header = self.clean_html(html)
@@ -257,7 +337,7 @@ class Pipeline:
                                             
                                             It is MANDATORY that if a url is found it is returned with 'https://' in the beginning
                                             It is MANDATORY that if a url is not found the result is 'NotFound' exactly like this""")[:-1]
-                    
+                                                  
                     if response.lower() == 'notfound':
                         return False
                     
@@ -275,13 +355,16 @@ class Pipeline:
             return False
 
     def download_images_gemini(self):
+        """
+        Download logo images using Gemini AI to extract logo URLs from website headers.
+        This is used as a fallback when Clearbit doesn't have the logo.
+        """
         load_dotenv()
         
         total = len(self.df['domain'])
         successful = 0
         
         progress_bar = tqdm(total=total, desc="Downloading logos", unit="logo")
-        
         # Using ThreadPoolExecutor for parallel requests
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # Submit all tasks and get futures
@@ -307,12 +390,11 @@ class Pipeline:
         """
         Clean SVG file by replacing HTML entities with proper XML entities
         
-        Parameters:
-        svg_file_path (str): Path to the input SVG file
-        output_file_path (str): Path where the cleaned SVG will be saved (optional)
-        
+        Args:
+            svg_file_path (str): Path to the input SVG file
+            
         Returns:
-        str: Path to the cleaned SVG file
+            str: Path to the cleaned SVG file, or None if cleaning failed
         """
         base, ext = os.path.splitext(svg_file_path)
         output_file_path = f"{base}_cleaned{ext}"
@@ -343,7 +425,7 @@ class Pipeline:
 
     def convert_svgs(self):
         """
-        Convert SVG files to PNG format using cairosvg.
+        Convert SVG files to PNG format using cairosvg for compatibility.
         """
                 
         # Get all files in the images directory
@@ -375,6 +457,9 @@ class Pipeline:
         print("Converted SVGs to PNG successfully.")
 
     def load_model(self):
+        """
+        Initialize and load the LogoNet model for feature extraction.
+        """
         # Initialize model
         self.model = LogoNet()
         self.model.eval()
@@ -390,14 +475,17 @@ class Pipeline:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
-    # Function to extract logo features using pretrained model
     def extract_logo_features(self, image_path):
-        """Extract features from a logo image using a specialized logo model"""
-        try:
-            # # Open image
-            # image = Image.open(f"./images/{image_path}").convert('RGB')
+        """
+        Extract features from a logo image using the specialized logo model.
+        
+        Args:
+            image_path (str): Path to the logo image
             
-             
+        Returns:
+            tuple: (normalized_features, image_path) or None if extraction failed
+        """
+        try:
             # Read the image with alpha channel (if available)
             img = cv2.imread(f"./images/{image_path}", cv2.IMREAD_UNCHANGED)
             if img is None:
@@ -416,9 +504,6 @@ class Pipeline:
 
             else:
                 img = img[:, :, :3]  # Remove alpha channel if not needed
-            
-            # # Convert to grayscale
-            # img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
             img = Image.fromarray(img)
             
@@ -441,6 +526,9 @@ class Pipeline:
             return None
         
     def extract_features(self):
+        """
+        Extract features from all downloaded logo images using the model.
+        """
         filenames = os.listdir('./images')
         print(f"Extracting features from {len(filenames)} images...")
 
@@ -467,26 +555,25 @@ class Pipeline:
         print(f"Extracted {len(self.features)} features successfully.")
 
     def generate_clusters(self):
+        """
+        Generate clusters of similar logos based on feature similarity.
+        Uses BallTree for efficient nearest neighbor search.
+        """
         # During initialization
         features_array = np.vstack([f[0].cpu().numpy() for f in self.features if f is not None])
         filenames = [f[1] for f in self.features if f is not None]
-        self.tree = BallTree(features_array, leaf_size=40, metric='euclidean')
+        
+        normalized_features = features_array / np.linalg.norm(features_array, axis=1, keepdims=True)
+        self.tree = BallTree(normalized_features, leaf_size=40, metric='euclidean')
 
         # During clustering
         clusters = {}
         indices_map = {}
-        for i, feature in enumerate(tqdm(features_array)):
+        for i, feature in enumerate(tqdm(normalized_features, desc="Clustering", unit="logo")):
             # Find all neighbors within threshold distance
             indices = self.tree.query_radius([feature], r=1-self.similarity_threshold)[0]
             
             # Find which existing cluster this belongs to, if any
-            # assigned = False
-            # for cluster_id in list(clusters.keys()):
-            #     if any(idx in clusters[cluster_id] for idx in indices):
-            #         clusters[cluster_id].append(i)
-            #         indices_map[i] = cluster_id
-            #         assigned = True
-            #         break
             if indices.size > 0:
                 # Filter indices to only include those that have already been assigned to clusters
                 assigned_indices = [i for i in indices if i in indices_map]
@@ -518,47 +605,10 @@ class Pipeline:
         print("Clustering completed.")
         print(f"Number of clusters: {len(self.image_clusters)}")
 
-    # def generate_clusters(self):        
-    #     # Total number of features to process
-    #     total_features = len(self.features)
-
-    #     # Iterate through features with a progress bar
-    #     for feature in tqdm(self.features, desc="Clustering Images", unit="image", total=total_features):
-    #         if feature is None:
-    #             continue
-    #         feature, filename = feature
-            
-    #         best_cluster = -1
-    #         best_cluster_raport = 0
-
-    #         for i in range(len(self.clusters)):
-    #             cluster = self.clusters[i]
-    #             close = 0
-    #             far = 0
-
-    #             for image_feature in cluster:
-    #                 similarity = F.cosine_similarity(feature, image_feature, dim=1).item()
-                    
-    #                 if similarity < self.similarity_threshold:
-    #                     far += 1
-    #                 else:
-    #                     close += 1
-
-    #             if close / (close + far) > 0.8 and close / (close + far) > best_cluster_raport:
-    #                 best_cluster = i
-    #                 best_cluster_raport = close / (close + far)
-
-    #         if best_cluster == -1:
-    #             self.clusters.append([feature])
-    #             self.image_clusters.append([filename])
-    #         else:
-    #             self.clusters[best_cluster].append(feature)
-    #             self.image_clusters[best_cluster].append(filename)
-                
-    #     print("Clustering completed.")
-    #     print(f"Number of clusters: {len(self.clusters)}")
-
     def generate_output(self):
+        """
+        Generate output directories with clustered logos and save cluster information to JSON.
+        """
         
         for i in range(len(self.image_clusters)):
             if not os.path.exists(f"./clusters/cluster{i}"):
@@ -579,15 +629,22 @@ class Pipeline:
         shutuil.rmtree('./images')
         print("Output generated successfully.")
 
-    def run(self):
+    def run(self, run_with_gemini=False):
+        """
+        Run the complete pipeline from data loading to output generation.
+        
+        Args:
+            run_with_gemini (bool): Whether to use Gemini API as fallback. Default is False.
+        """
         
         self.load_data()
         
         self.download_images_clearbit()
         
-        self.download_images_gemini()
+        if run_with_gemini:
+            self.download_images_gemini()
         
-        self.convert_svgs()
+            self.convert_svgs()
         
         self.load_model()
         
@@ -600,8 +657,13 @@ class Pipeline:
         print("Pipeline completed successfully.")
         
 if __name__ == "__main__":
-    input_file = 'logos.snappy.parquet'
+    input_file = input("Enter the path to the input .parquet file : ")
     output_dir = 'clusters'
     pipeline = Pipeline(input_file, output_dir, similarity_threshold=0.6)
-    pipeline.run()
     
+    run_with_gemini = len(sys.argv) > 1 and sys.argv[1] == 'run_with_gemini'
+    
+    if run_with_gemini:
+        print("Using Gemini API for logo extraction.")
+
+    pipeline.run(run_with_gemini)
